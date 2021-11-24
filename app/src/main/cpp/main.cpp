@@ -57,16 +57,24 @@ static const GLchar *vertexShaderSource[] = {"#version 300 es \n"
                                              "layout(location = 0) in vec4 vPosition;\n"
                                              "uniform mat4 u_Matrix;"
                                              "out vec2 fragCoord;\n"
+                                             "uniform vec4 touchPoint;\n"
+                                             "out vec3 iMouse;\n"
+                                             "out vec3 iResolution;\n"
+                                             "uniform vec3 viewRange;\n"
                                              "void main()\n"
                                              "{\n"
-                                             "   fragCoord = vPosition.xy;\n"
-                                             "   gl_Position = vPosition * u_Matrix;\n"
+                                             "   vec2 ratio = (vPosition.xy+vec2(1.0,1.0))*.5;\n"
+                                             "   fragCoord = vec2(ratio.x*viewRange.x,ratio.y*viewRange.y);\n"
+                                             "   iMouse = (touchPoint).xyz;\n"
+                                             "   iResolution = viewRange;\n"
+                                             "   gl_Position = vPosition ;\n"
                                              "}\0"};
 static const GLchar *fragmentShaderSource[] = {"#version 300 es \n"
                                                "precision mediump float;\n"
                                                "out vec4 fragColor;\n"
                                                "uniform float iTime;\n"
-                                               "uniform vec3 iResolution;\n"
+                                               "in vec3 iMouse;\n"
+                                               "in vec3 iResolution;\n"
                                                "in vec2 fragCoord;\n"
                                                "float sdCircle( in vec2 p, in float r ) \n"
                                                "{\n"
@@ -74,13 +82,20 @@ static const GLchar *fragmentShaderSource[] = {"#version 300 es \n"
                                                "}\n"
                                                "void main()\n"
                                                "{\n"
-                                               "   vec2 p = fragCoord;\n"
+                                               "   vec2 p = (2.*fragCoord-iResolution.xy)/(iResolution.x);\n"
+                                               "   vec2 m = vec2((2.*iMouse.x-iResolution.x)/(iResolution.x),(iResolution.y-2.*iMouse.y)/(iResolution.x));\n"
                                                "   float d = sdCircle(p,0.5);\n"
                                                "    // coloring\n"
                                                "    vec3 col = vec3(1.0) - sign(d)*vec3(0.1,0.4,0.7);\n"
                                                "    col *= 1.0 - exp(-3.0*abs(d));\n"
                                                "    col *= 0.8 + 0.2*cos(150.0*d);\n"
                                                "    col = mix( col, vec3(1.0), 1.0-smoothstep(0.0,0.01,abs(d)) );\n"
+                                               "    if( iMouse.z!=0.001 )\n"
+                                               "    {\n"
+                                               "    d = sdCircle(m,0.5);\n"
+                                               "    col = mix(col, vec3(1.0,1.0,0.0), 1.0-smoothstep(0.0, 0.005, abs(length(p-m)-abs(d))-0.0025));\n"
+                                               "    col = mix(col, vec3(1.0,1.0,0.0), 1.0-smoothstep(0.0, 0.005, length(p-m)-0.015));\n"
+                                               "    }\n"
                                                "    fragColor = vec4(col, 1.);\n"
                                                "}\n\0"};
 
@@ -267,10 +282,12 @@ static void engine_draw_frame(struct engine *engine) {
                           originX+RANGE, originY+RANGE, 0.0f
                           };
     GLfloat resolution[] = {engine->width * 1.0f, engine->height * 1.0f, 0.f};
+    GLfloat touchPoints[] ={engine->state.x*1.f,1.f*engine->state.y,1.0f,0.0f};
     glViewport(0, 0, engine->width, engine->height);
     glUseProgram(engine->gldata.program);
     glUniformMatrix4fv(glGetUniformLocation(engine->gldata.program,"u_Matrix"),1,GL_FALSE,matrix);
-    glUniform3fv(glGetUniformLocation(engine->gldata.program, "iResolution"), 1, resolution);
+    glUniform3fv(glGetUniformLocation(engine->gldata.program, "viewRange"), 1, resolution);
+    glUniform4fv(glGetUniformLocation(engine->gldata.program, "touchPoint"), 1, touchPoints);
     glUniform1f(glGetUniformLocation(engine->gldata.program, "iTime"), deltaTime);
 
     glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 0, vertices);
