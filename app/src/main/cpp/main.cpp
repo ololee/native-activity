@@ -1,0 +1,456 @@
+#include <initializer_list>
+#include <memory>
+#include <cstdlib>
+#include <cstring>
+#include <jni.h>
+#include <cerrno>
+#include <cassert>
+#include <EGL/egl.h>
+#include <GLES/gl.h>
+#include <GLES3/gl3.h>
+#include <GLES3/gl3ext.h>
+#include <android/sensor.h>
+#include <android/log.h>
+#include <android_native_app_glue.h>
+
+#define LOGI(...) ((void)__android_log_print(ANDROID_LOG_INFO, "native-activity", __VA_ARGS__))
+#define LOGW(...) ((void)__android_log_print(ANDROID_LOG_WARN, "native-activity", __VA_ARGS__))
+
+
+struct saved_state {
+    float angle;
+    int32_t x;
+    int32_t y;
+    struct timeval startTime;
+};
+
+struct glstruct {
+    GLuint program;
+    GLuint vertexShader;
+    GLuint fragmentShader;
+};
+
+
+struct engine {
+    struct android_app *app;
+    ASensorManager *sensorManager;
+    const ASensor *accelerometerSensor;
+    ASensorEventQueue *sensorEventQueue;
+    int animating;
+    EGLDisplay display;
+    EGLSurface surface;
+    EGLContext context;
+    int32_t width;
+    int32_t height;
+    struct saved_state state;
+    struct glstruct gldata;
+};
+
+
+static const GLchar *vertexShaderSource[] = {"#version 300 es \n"
+                                             "layout(location = 0) in vec4 vPosition;\n"
+                                             "void main()\n"
+                                             "{\n"
+                                             "   gl_Position = vPosition;\n"
+                                             "}\0"};
+static const GLchar *fragmentShaderSource[] = {"#version 300 es\n"
+                                               "precision mediump float;\n"
+                                               "out vec4 fragColor;\n"
+                                               "float sdCircle( in vec2 p, in float r ) \n"
+                                               "{\n"
+                                               "    return length(p)-r;\n"
+                                               "}\n"
+                                               "void main()\n"
+                                               "{\n"
+                                               "   fragColor = vec4(1.0, 0.0, 0.0, 1.0);\n"
+                                               "}\n\0"};
+
+
+static void checkShaderCompile(GLuint shader) {
+    GLint compiled;
+    glGetShaderiv(shader, GL_COMPILE_STATUS, &compiled);
+    GLint infoLen = 0;
+    glGetShaderiv(shader, GL_INFO_LOG_LENGTH, &infoLen);
+    if (!compiled) {
+        if (infoLen > 1) {
+            char *infoLog = (char *) malloc(sizeof(char) * infoLen);
+            glGetShaderInfoLog(shader, infoLen, NULL, infoLog);
+            LOGW("Error compiling shader:[%s]", infoLog);
+            free(infoLog);
+        }
+        glDeleteShader(shader);
+    } else {
+        LOGI("编译完成，没有错误");
+    }
+}
+
+static int engine_init_display(struct engine *engine) {
+    const EGLint attribs[] = {
+            EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
+            EGL_BLUE_SIZE, 8,
+            EGL_GREEN_SIZE, 8,
+            EGL_RED_SIZE, 8,
+            EGL_NONE
+    };
+    EGLint w, h, format;
+    EGLint numConfigs;
+    EGLConfig config = nullptr;
+    EGLSurface surface;
+    EGLContext context;
+    EGLDisplay display = eglGetDisplay(EGL_DEFAULT_DISPLAY);
+    if (!eglInitialize(display, nullptr, nullptr)) {
+        LOGW("egl 初始化失败");
+        return 0;
+    }
+    eglChooseConfig(display, attribs, nullptr, 0, &numConfigs);
+    std::unique_ptr<EGLConfig[]> supportedConfigs(new EGLConfig[numConfigs]);
+    assert(supportedConfigs);
+    eglChooseConfig(display, attribs, supportedConfigs.get(), numConfigs, &numConfigs);
+    assert(numConfigs);
+    auto i = 0;
+    for (; i < numConfigs; i++) {
+        auto &cfg = supportedConfigs[i];
+        EGLint r, g, b, d;
+        if (eglGetConfigAttrib(display, cfg, EGL_RED_SIZE, &r) &&
+            eglGetConfigAttrib(display, cfg, EGL_GREEN_SIZE, &g) &&
+            eglGetConfigAttrib(display, cfg, EGL_BLUE_SIZE, &b) &&
+            eglGetConfigAttrib(display, cfg, EGL_DEPTH_SIZE, &d) &&
+            r == 8 && g == 8 && b == 8 && d == 0) {
+
+            config = supportedConfigs[i];
+            break;
+        }
+    }
+    if (i == numConfigs) {
+        config = supportedConfigs[0];
+    }
+
+    if (config == nullptr) {
+        LOGW("Unable to initialize EGLConfig");
+        return -1;
+    }
+    eglGetConfigAttrib(display, config, EGL_NATIVE_VISUAL_ID, &format);
+    surface = eglCreateWindowSurface(display, config, engine->app->window, nullptr);
+    EGLint contextAttribs[] =
+            {
+                    EGL_CONTEXT_CLIENT_VERSION,
+                    3,
+                    EGL_NONE
+            };
+    context = eglCreateContext(display, EGL_NO_CONTEXT, EGL_NO_CONTEXT, contextAttribs);
+    eglMakeCurrent(display, surface, surface, context);
+    if (auto error = glGetError()) {
+        LOGW("=======egl创建失败或者context创建失败:%d", error);
+    }
+    GLuint program = glCreateProgram();
+
+    if (program == 0) {
+        LOGW("create program failed.");
+    } else {
+        LOGW("program 创建成功");
+    }
+    GLuint vertexShader = glCreateShader(GL_VERTEX_SHADER);
+    GLuint fragmentShader = glCreateShader(GL_FRAGMENT_SHADER);
+    if (vertexShader == 0) {
+        LOGW("vertexShader create failed.");
+    }
+    glShaderSource(vertexShader, 1, vertexShaderSource, NULL);
+    glCompileShader(vertexShader);
+    checkShaderCompile(vertexShader);
+
+    glShaderSource(fragmentShader, 1, fragmentShaderSource, NULL);
+    glCompileShader(fragmentShader);
+    checkShaderCompile(fragmentShader);
+
+
+    glAttachShader(program, vertexShader);
+    glAttachShader(program, fragmentShader);
+    glLinkProgram(program);
+    GLint linked;
+    glGetProgramiv(program, GL_LINK_STATUS, &linked);
+    if (!linked) {
+        GLint infoLen = 0;
+        glGetProgramiv(program, GL_INFO_LOG_LENGTH, &infoLen);
+        if (infoLen > 1) {
+            char *infoLog = (char *) malloc(sizeof(char) * infoLen);
+            glGetProgramInfoLog(program, infoLen, NULL, infoLog);
+            LOGW("Error linking program:[%s]", infoLog);
+            free(infoLog);
+        }
+        glDeleteProgram(program);
+        return -1;
+    }
+    engine->gldata = {
+            .program=program,
+            .vertexShader=vertexShader,
+            .fragmentShader=fragmentShader
+    };
+    if (eglMakeCurrent(display, surface, surface, context) == EGL_FALSE) {
+        LOGW("Unable to eglMakeCurrent");
+        return -1;
+    }
+
+    eglQuerySurface(display, surface, EGL_WIDTH, &w);
+    eglQuerySurface(display, surface, EGL_HEIGHT, &h);
+
+    engine->display = display;
+    engine->context = context;
+    engine->surface = surface;
+    engine->width = w;
+    engine->height = h;
+    engine->state.angle = 0;
+
+    // Check openGL on the system
+    auto opengl_info = {GL_VENDOR, GL_RENDERER, GL_VERSION, GL_EXTENSIONS};
+    for (auto name : opengl_info) {
+        auto info = glGetString(name);
+        LOGI("OpenGL Info: %s", info);
+    }
+    // Initialize GL state.
+    glHint(GL_PERSPECTIVE_CORRECTION_HINT, GL_FASTEST);
+    glEnable(GL_CULL_FACE);
+    glShadeModel(GL_SMOOTH);
+    glDisable(GL_DEPTH_TEST);
+
+    return 0;
+}
+
+#define RANGE 0.5f
+
+static void engine_draw_frame(struct engine *engine) {
+    if (engine->display == nullptr) {
+        return;
+    }
+
+    glClearColor(((float) engine->state.x) / engine->width, engine->state.angle,((float) engine->state.y) / engine->height, 1);
+    glClear(GL_COLOR_BUFFER_BIT);
+    float originX = ((float) engine->state.x) * 2 / engine->width - 1;
+    float originY = -((float) engine->state.y) * 2 / engine->height + 1;
+    GLfloat vertices[] = {originX-RANGE,originY+RANGE, 0.0f,
+                          originX-RANGE, originY-RANGE, 0.0f,
+                          originX+RANGE, originY-RANGE, 0.0f,
+                          originX-RANGE,originY+RANGE,0.0f,
+                          originX+RANGE, originY-RANGE,0.0f,
+                          originX+RANGE, originY+RANGE, 0.0f
+                          };
+    glViewport(0, 0, engine->width, engine->height);
+    glUseProgram(engine->gldata.program);
+
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 0, vertices);
+    glEnableVertexAttribArray(0);
+    glDrawArrays(GL_TRIANGLES,0,3);
+    glDrawArrays(GL_TRIANGLES,3,3);
+
+    eglSwapBuffers(engine->display, engine->surface);
+}
+
+
+static void engine_term_display(struct engine *engine) {
+    if (engine->display != EGL_NO_DISPLAY) {
+        eglMakeCurrent(engine->display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+        if (engine->context != EGL_NO_CONTEXT) {
+            eglDestroyContext(engine->display, engine->context);
+        }
+        if (engine->surface != EGL_NO_SURFACE) {
+            eglDestroySurface(engine->display, engine->surface);
+        }
+        eglTerminate(engine->display);
+    }
+    engine->animating = 0;
+    engine->display = EGL_NO_DISPLAY;
+    engine->context = EGL_NO_CONTEXT;
+    engine->surface = EGL_NO_SURFACE;
+}
+
+/**
+ * Process the next input event.
+ */
+static int32_t engine_handle_input(struct android_app *app, AInputEvent *event) {
+    auto *engine = (struct engine *) app->userData;
+    if (AInputEvent_getType(event) == AINPUT_EVENT_TYPE_MOTION) {
+        engine->animating = 1;
+        engine->state.x = AMotionEvent_getX(event, 0);
+        engine->state.y = AMotionEvent_getY(event, 0);
+        return 1;
+    }
+    return 0;
+}
+
+/**
+ * Process the next main command.
+ */
+static void engine_handle_cmd(struct android_app *app, int32_t cmd) {
+    auto *engine = (struct engine *) app->userData;
+    switch (cmd) {
+        case APP_CMD_SAVE_STATE:
+            engine->app->savedState = malloc(sizeof(struct saved_state));
+            *((struct saved_state *) engine->app->savedState) = engine->state;
+            engine->app->savedStateSize = sizeof(struct saved_state);
+            break;
+        case APP_CMD_INIT_WINDOW:
+            if (engine->app->window != nullptr) {
+                engine_init_display(engine);
+                engine_draw_frame(engine);
+            }
+            break;
+        case APP_CMD_TERM_WINDOW:
+            engine_term_display(engine);
+            break;
+        case APP_CMD_GAINED_FOCUS:
+            if (engine->accelerometerSensor != nullptr) {
+                ASensorEventQueue_enableSensor(engine->sensorEventQueue,
+                                               engine->accelerometerSensor);
+                ASensorEventQueue_setEventRate(engine->sensorEventQueue,
+                                               engine->accelerometerSensor,
+                                               (1000L / 60) * 1000);
+            }
+            break;
+        case APP_CMD_LOST_FOCUS:
+            if (engine->accelerometerSensor != nullptr) {
+                ASensorEventQueue_disableSensor(engine->sensorEventQueue,
+                                                engine->accelerometerSensor);
+            }
+            // Also stop animating.
+            engine->animating = 0;
+            engine_draw_frame(engine);
+            break;
+        default:
+            break;
+    }
+}
+
+/*
+ * AcquireASensorManagerInstance(void)
+ *    Workaround ASensorManager_getInstance() deprecation false alarm
+ *    for Android-N and before, when compiling with NDK-r15
+ */
+#include <dlfcn.h>
+
+ASensorManager *AcquireASensorManagerInstance(android_app *app) {
+
+    if (!app)
+        return nullptr;
+
+    typedef ASensorManager *(*PF_GETINSTANCEFORPACKAGE)(const char *name);
+    void *androidHandle = dlopen("libandroid.so", RTLD_NOW);
+    auto getInstanceForPackageFunc = (PF_GETINSTANCEFORPACKAGE)
+            dlsym(androidHandle, "ASensorManager_getInstanceForPackage");
+    if (getInstanceForPackageFunc) {
+        JNIEnv *env = nullptr;
+        app->activity->vm->AttachCurrentThread(&env, nullptr);
+
+        jclass android_content_Context = env->GetObjectClass(app->activity->clazz);
+        jmethodID midGetPackageName = env->GetMethodID(android_content_Context,
+                                                       "getPackageName",
+                                                       "()Ljava/lang/String;");
+        auto packageName = (jstring) env->CallObjectMethod(app->activity->clazz,
+                                                           midGetPackageName);
+
+        const char *nativePackageName = env->GetStringUTFChars(packageName, nullptr);
+        ASensorManager *mgr = getInstanceForPackageFunc(nativePackageName);
+        env->ReleaseStringUTFChars(packageName, nativePackageName);
+        app->activity->vm->DetachCurrentThread();
+        if (mgr) {
+            dlclose(androidHandle);
+            return mgr;
+        }
+    }
+
+    typedef ASensorManager *(*PF_GETINSTANCE)();
+    auto getInstanceFunc = (PF_GETINSTANCE)
+            dlsym(androidHandle, "ASensorManager_getInstance");
+    // by all means at this point, ASensorManager_getInstance should be available
+    assert(getInstanceFunc);
+    dlclose(androidHandle);
+
+    return getInstanceFunc();
+}
+
+
+
+
+/**
+ * This is the main entry point of a native application that is using
+ * android_native_app_glue.  It runs in its own thread, with its own
+ * event loop for receiving input events and doing other things.
+ */
+void android_main(struct android_app *state) {
+    struct engine engine{};
+
+    memset(&engine, 0, sizeof(engine));
+    state->userData = &engine;
+    state->onAppCmd = engine_handle_cmd;
+    state->onInputEvent = engine_handle_input;
+    engine.app = state;
+
+
+    // Prepare to monitor accelerometer
+    engine.sensorManager = AcquireASensorManagerInstance(state);
+    engine.accelerometerSensor = ASensorManager_getDefaultSensor(
+            engine.sensorManager,
+            ASENSOR_TYPE_ACCELEROMETER);
+    engine.sensorEventQueue = ASensorManager_createEventQueue(
+            engine.sensorManager,
+            state->looper, LOOPER_ID_USER,
+            nullptr, nullptr);
+
+    if (state->savedState != nullptr) {
+        // We are starting with a previous saved state; restore from it.
+        engine.state = *(struct saved_state *) state->savedState;
+    }
+
+    gettimeofday(&engine.state.startTime, NULL);
+
+    // loop waiting for stuff to do.
+
+    while (true) {
+        // Read all pending events.
+        int ident;
+        int events;
+        struct android_poll_source *source;
+
+        // If not animating, we will block forever waiting for events.
+        // If animating, we loop until all events are read, then continue
+        // to draw the next frame of animation.
+        while ((ident = ALooper_pollAll(engine.animating ? 0 : -1, nullptr, &events,
+                                        (void **) &source)) >= 0) {
+
+            // Process this event.
+            if (source != nullptr) {
+                source->process(state, source);
+            }
+
+            // If a sensor has data, process it now.
+            if (ident == LOOPER_ID_USER) {
+                if (engine.accelerometerSensor != nullptr) {
+                    ASensorEvent event;
+//                    while ( > 0) {
+////                        LOGI("accelerometer: x=%f y=%f z=%f",
+////                             event.acceleration.x, event.acceleration.y,
+////                             event.acceleration.z);
+//                    }
+                    ASensorEventQueue_getEvents(engine.sensorEventQueue,
+                                                &event, 1);
+                }
+            }
+
+            // Check if we are exiting.
+            if (state->destroyRequested != 0) {
+                engine_term_display(&engine);
+                return;
+            }
+        }
+
+        if (engine.animating) {
+            engine.state.angle += .01f;
+            if (engine.state.angle > 1) {
+                engine.state.angle = 0;
+            }
+
+        }
+
+        engine_draw_frame(&engine);
+    }
+
+
+}
