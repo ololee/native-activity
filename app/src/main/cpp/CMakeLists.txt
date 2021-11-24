@@ -11,9 +11,16 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=gnu++11 -Wall -Werror")
 set(CMAKE_SHARED_LINKER_FLAGS
     "${CMAKE_SHARED_LINKER_FLAGS} -u ANativeActivity_onCreate")
 
-add_library(native-activity SHARED main.cpp)
 include_directories(shadertoy
-        utils)
+        utils
+        shadertoy)
+file(GLOB src-files
+        ${CMAKE_SOURCE_DIR}/shadertoy/*.cpp
+        ${CMAKE_SOURCE_DIR}/utils/*.cpp)
+
+add_library(native-activity SHARED main.cpp
+        ${src-files})
+
 
 target_include_directories(native-activity PRIVATE
     ${ANDROID_NDK}/sources/android/native_app_glue)

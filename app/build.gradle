@@ -11,6 +11,7 @@ android {
         externalNativeBuild {
             cmake {
                 arguments '-DANDROID_STL=c++_static'
+                cppFlags "-fexceptions -Werror -Wunused-function"
             }
         }
     }
